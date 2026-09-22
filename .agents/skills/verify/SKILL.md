@@ -71,7 +71,113 @@ go build -o /tmp/tailcat-verify ./cmd/tailcat
 
 Any test or build failure is **FAIL** unless the failure is proven unrelated to the candidate and is explicitly documented.
 
-## 2. Launch a narrow real receiver
+## 2. Run long build/test work as a durable job
+
+Do not keep `go test ./...` or a cold-cache build attached to one short-lived MCP/tool call. A caller timeout is **not** a test failure.
+
+When the execution host may take longer than the orchestration call budget:
+
+1. create a per-candidate job directory;
+2. run clone/test/build in the background on the execution host;
+3. stream stdout/stderr into a durable log file;
+4. write a small status file only after the job has finished;
+5. record the PID;
+6. wait based on an evidence-backed duration estimate;
+7. poll the status file and log until a real exit code exists.
+
+Recommended layout:
+
+```text
+jobs/tailcat-verify-<short-sha>/
+  run.sh
+  pid.txt
+  verify.log
+  status.txt
+  repo/
+  tailcat-verify
+```
+
+A useful status contract is:
+
+```text
+DONE
+OVERALL_RC=0
+TEST_RC=0
+BUILD_RC=0
+VERSION_RC=0
+```
+
+Do not infer success from a missing status file. Missing status means **still running or interrupted**; inspect the PID and log.
+
+### Timing and polling
+
+Estimate before waiting. Use recent upstream CI durations when available, then adjust for the actual worker and cache state.
+
+Observed baseline from the 2026-09-22 verification:
+
+- recent upstream Tailcat full Test workflows were roughly **3–5 minutes**;
+- a cold Grokbot Linux worker downloaded Go/toolchain/dependencies and completed `go test ./...` in **74 seconds**;
+- the subsequent `go build ./cmd/tailcat` took **2 seconds**;
+- clone + test + build + version completed in about **86 seconds**.
+
+Practical polling policy:
+
+```text
+cold worker:
+  first check after ~90–120s
+
+warm worker:
+  first check after ~30–60s
+
+still running after ~5m:
+  inspect log for progress instead of declaring failure
+
+no meaningful log progress by ~8–10m:
+  investigate a hang, dependency/network problem, or worker issue
+```
+
+If the orchestrator itself cannot hold a long `sleep`, do not block one tool call just to wait. Leave the job running on the execution host and poll its durable status/log on the next call.
+
+Example background runner:
+
+```sh
+JOB="jobs/tailcat-verify-$(git rev-parse --short HEAD)"
+mkdir -p "$JOB"
+
+nohup sh -c '
+  set +e
+  exec >>"'"$JOB"'/verify.log" 2>&1
+
+  go test ./...
+  TEST_RC=$?
+
+  go build -o "'"$JOB"'/tailcat-verify" ./cmd/tailcat
+  BUILD_RC=$?
+
+  if [ "$BUILD_RC" -eq 0 ]; then
+    "'"$JOB"'/tailcat-verify" version
+    VERSION_RC=$?
+  else
+    VERSION_RC=99
+  fi
+
+  OVERALL_RC=0
+  [ "$TEST_RC" -ne 0 ] && OVERALL_RC="$TEST_RC"
+  [ "$BUILD_RC" -ne 0 ] && OVERALL_RC="$BUILD_RC"
+  [ "$VERSION_RC" -ne 0 ] && OVERALL_RC="$VERSION_RC"
+
+  printf "DONE\nOVERALL_RC=%s\nTEST_RC=%s\nBUILD_RC=%s\nVERSION_RC=%s\n" \
+    "$OVERALL_RC" "$TEST_RC" "$BUILD_RC" "$VERSION_RC" >"'"$JOB"'/status.txt"
+
+  exit "$OVERALL_RC"
+' >/dev/null 2>&1 &
+
+echo $! >"$JOB/pid.txt"
+```
+
+The exact shell can vary by executor; the durable **log + status + PID** contract is what matters.
+
+## 3. Launch a narrow real receiver
 
 Use a random challenge and a single-purpose `exec` service. Keep stdout/stderr in a temporary directory.
 
@@ -94,7 +200,9 @@ Wait until stderr contains:
 Server listening with new address:
 ```
 
-Extract the address only in-memory. Do **not** print it into durable verification reports. For evidence, compute a fingerprint such as:
+The listener itself prints the address to stderr, so the raw runtime log is temporarily sensitive. Extract the address for the active test, then ensure the durable evidence copy replaces the full address with `[REDACTED]`. After the listener is stopped, delete or sanitize any raw file that still contains the address.
+
+Do **not** print the address into durable verification reports. For evidence, compute a fingerprint such as:
 
 ```sh
 printf '%s' "$TAILCAT_ADDR" | shasum -a 256
@@ -102,7 +210,7 @@ printf '%s' "$TAILCAT_ADDR" | shasum -a 256
 
 Record only the SHA-256 fingerprint.
 
-## 3. Drive it from a real peer
+## 4. Drive it from a real peer
 
 ### Preferred: independent CLI peer
 
@@ -148,7 +256,7 @@ Important: browser Tailcat traffic is DERP-relayed because browsers currently ca
 - browser traffic remaining on DERP is **expected**;
 - do not require `--until-direct` for the browser path.
 
-## 4. Capture server-side runtime evidence
+## 5. Capture server-side runtime evidence
 
 For a successful real connection, preserve the relevant **redacted** lines from the listener log. Strong evidence includes:
 
@@ -169,7 +277,7 @@ or a `tailcat ping --until-direct` pong that reports a direct endpoint.
 
 Do not infer direct P2P from a successful TCP session alone. DERP fallback is a legitimate successful transport.
 
-## 5. Verify the application payload
+## 6. Verify the application payload
 
 Network handshake evidence alone proves the tunnel formed, but not that the requested application data path worked.
 
@@ -187,7 +295,7 @@ For a human-driven phone/browser test, capture both:
 
 If only the handshake/TCP evidence is available, report that specific layer as verified and the application ACK as unverified.
 
-## 6. Run an adjacent probe
+## 7. Run an adjacent probe
 
 Every verification must include at least one nearby failure/edge case.
 
@@ -218,7 +326,7 @@ Other valid adjacent probes when relevant:
 
 Choose the probe closest to the code that changed.
 
-## 7. Judge
+## 8. Judge
 
 Use exactly one overall state.
 
@@ -262,7 +370,7 @@ State exactly what was verified before the block and what remains unverified.
 
 Use SKIP only when a verification surface is demonstrably irrelevant to the candidate. Give the reason.
 
-## 8. Evidence report format
+## 9. Evidence report format
 
 Keep the final report compact and auditable:
 
@@ -282,11 +390,24 @@ Cleanup: listener stopped, ephemeral address inactive
 Evidence: <paths/log excerpts/screenshots as applicable>
 ```
 
-## Known-good baseline
+## Known-good baselines
 
-On 2026-09-22, a Tailcat CLI listener running on a Mac mini was reached from the official Tailcat browser/WASM client on a phone over the public internet. The server recorded a new peer, WireGuard handshake initiation/response, and an accepted TCP connection.
+These are historical examples of successful verification topologies. They are **not** proof that a future candidate passes.
 
-Use that result only as a **historical known-good topology**:
+### Browser interoperability baseline — 2026-09-22
+
+A Tailcat CLI listener on a Mac mini was reached from the official Tailcat browser/WASM client on a phone over the public internet.
+
+Observed server evidence:
+
+```text
+new peer
+WireGuard handshake initiation
+WireGuard handshake response
+TCP accept
+```
+
+Topology:
 
 ```text
 Phone browser/WASM
@@ -298,7 +419,98 @@ Tailcat CLI on Mac mini
 WireGuard handshake + TCP accept
 ```
 
-It is not proof that a future candidate passes. Re-run verification against the exact candidate.
+This proves browser/CLI interoperability and real cross-device connectivity. It does not prove direct P2P because the browser implementation is DERP-only.
+
+### Exact-candidate CLI baseline — 2026-09-22
+
+Candidate:
+
+```text
+67ba6dc9d89d34b7d646f5ea3663486fbf99e2b9
+```
+
+Execution host: Grokbot Linux x86_64, cold cache.
+
+Build/test evidence:
+
+```text
+go test ./...                  PASS, 74s
+go build ./cmd/tailcat         PASS, 2s
+built binary version           v0.0.0-20260922001426-67ba6dc9d89d
+TEST_RC                        0
+BUILD_RC                       0
+VERSION_RC                     0
+OVERALL_RC                     0
+```
+
+The built candidate binary was then used as the **server**, not replaced by a package-manager installation.
+
+Independent peer: Mac mini.
+
+Application challenge:
+
+```text
+client → server:
+MAC_TO_GROK_<timestamp>
+
+server → client:
+GROKBOT_ACK:MAC_TO_GROK_<same timestamp>
+```
+
+Transport evidence:
+
+```text
+initial ping: DERP(sfo)
+then:
+Received handshake initiation
+Sending handshake response
+via=direct
+Accept: TCP ... tcp ok
+
+tailcat ping --until-direct:
+pong ... via <public-ip>:<port>
+```
+
+This demonstrated a real progression:
+
+```text
+Grokbot candidate binary
+        ↕
+DERP bootstrap
+        ↓
+WireGuard handshake
+        ↓
+direct P2P upgrade
+        ↕
+Mac mini independent peer
+        ↓
+exact challenge / ACK
+```
+
+Adjacent probe:
+
+1. stop the Grokbot ephemeral listener;
+2. retry `tailcat ping --timeout=3s <same-address>` from the Mac mini;
+3. require a non-zero exit.
+
+Observed result:
+
+```text
+AFTER_STOP_RC=1
+ping: context deadline exceeded
+```
+
+That is the expected failure and confirms the ephemeral listener was no longer usable.
+
+The canonical execution evidence for that run used durable files on Grokbot:
+
+```text
+jobs/tailcat-verify-67ba6dc9d/verify.log
+jobs/tailcat-verify-67ba6dc9d/status.txt
+jobs/tailcat-verify-67ba6dc9d/runtime-server.log  # sanitized after shutdown; Tailcat address redacted
+```
+
+Future runs should create a new per-candidate job directory and re-run all required steps.
 
 ## What does not count as verification
 
